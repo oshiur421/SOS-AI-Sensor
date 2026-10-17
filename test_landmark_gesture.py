@@ -2,6 +2,7 @@ import os
 import atexit
 import time
 import base64
+import argparse
 import threading
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -11,7 +12,7 @@ import joblib
 import numpy as np
 import mediapipe as mp
 import requests
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, render_template_string, request, jsonify
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -179,10 +180,33 @@ print("Hand Landmarker loaded!")
 
 
 # ==========================================
+# CLI ARGUMENT PARSING
+# ==========================================
+
+parser = argparse.ArgumentParser(description="AEGIS Hand Gesture Landmark Sensor")
+parser.add_argument(
+    "--input-source",
+    type=str,
+    default=os.environ.get("INPUT_SOURCE", "hardware"),
+    choices=["hardware", "api", "cloud"],
+    help="Input source mode: 'hardware' (local camera server stream) or 'api'/'cloud' (client-side API ingestion)"
+)
+parser.add_argument("--port", type=int, default=5000, help="Port to run gesture server on (default: 5000)")
+parser.add_argument("--host", type=str, default=os.environ.get("HOST", "0.0.0.0"), help="Host address to bind to (default: 0.0.0.0)")
+parser.add_argument("--camera-url", type=str, default=os.environ.get("CAMERA_URL", "http://127.0.0.1:8001/frame"), help="Camera frame URL")
+
+cli_args, _ = parser.parse_known_args()
+
+INPUT_SOURCE = "api" if cli_args.input_source.lower() in ["api", "cloud", "client"] else "hardware"
+SERVER_HOST = cli_args.host
+SERVER_PORT = cli_args.port
+CAMERA_URL = cli_args.camera_url
+
+
+# ==========================================
 # SHARED CAMERA SERVER SETUP
 # ==========================================
 
-CAMERA_URL = os.environ.get("CAMERA_URL", "http://127.0.0.1:8001/frame")
 http_session = requests.Session()
 
 
@@ -210,163 +234,236 @@ latest_frame_jpeg = None
 frame_lock = threading.Lock()
 
 
-def process_gestures():
-    """Continuous headless gesture detection loop running in background."""
+def process_gesture_frame(frame: np.ndarray) -> dict:
+    """
+    Core gesture recognition processor for a single BGR frame.
+    Runs MediaPipe Hand Landmarker and Random Forest classification.
+    Draws overlays, updates rolling SOS window, dispatches alerts, and updates latest_frame_jpeg.
+    """
     global last_alert_time, sos_timestamps, latest_frame_jpeg
-    print(f"\n[GESTURE] Single camera gesture processing active via {CAMERA_URL}.\n")
 
-    while True:
-        ret, frame = fetch_camera_frame()
-        if not ret or frame is None:
-            time.sleep(0.03)
-            continue
+    if frame is None or frame.size == 0:
+        return {
+            "gesture": "NO HAND",
+            "confidence": 0.0,
+            "threat_level": "LOW",
+            "sos_window_count": len(sos_timestamps)
+        }
 
-        # Frame fetched from CAMERA_URL is already horizontally mirrored by camera_server.py
-        # Clean up rolling window
-        current_time = time.time()
+    current_time = time.time()
+    with frame_lock:
         sos_timestamps = [t for t in sos_timestamps if current_time - t <= 20.0]
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result = detector.detect(mp_image)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = detector.detect(mp_image)
 
-        prediction_text = "NO HAND"
+    prediction_text = "NO HAND"
+    prediction = "NO HAND"
+    confidence = 0.0
 
-        # ======================================
-        # IF HAND IS DETECTED
-        # ======================================
-        if result.hand_landmarks:
-            hand = result.hand_landmarks[0]
+    if result.hand_landmarks:
+        hand = result.hand_landmarks[0]
+        wrist = hand[0]
 
-            # Wrist landmark
-            wrist = hand[0]
+        features = []
+        for landmark in hand:
+            x = landmark.x - wrist.x
+            y = landmark.y - wrist.y
+            z = landmark.z - wrist.z
+            features.extend([x, y, z])
 
-            # Create 63 landmark features
-            features = []
-            for landmark in hand:
-                x = landmark.x - wrist.x
-                y = landmark.y - wrist.y
-                z = landmark.z - wrist.z
-                features.extend([x, y, z])
+        X = np.array(features).reshape(1, -1)
+        prediction = classifier.predict(X)[0]
+        probabilities = classifier.predict_proba(X)[0]
+        confidence = float(np.max(probabilities))
+        prediction_text = f"{prediction} ({confidence:.2f})"
 
-            # Convert to NumPy
-            X = np.array(features).reshape(1, -1)
-
-            # Predict gesture
-            prediction = classifier.predict(X)[0]
-
-            # Prediction confidence
-            probabilities = classifier.predict_proba(X)[0]
-            confidence = np.max(probabilities)
-
-            prediction_text = f"{prediction} ({confidence:.2f})"
-
-            # Rolling 20-second Window Tracking
-            if prediction == "SOS" and confidence > 0.40:
+        if prediction == "SOS" and confidence > 0.40:
+            with frame_lock:
                 sos_timestamps.append(current_time)
                 sos_timestamps = [t for t in sos_timestamps if current_time - t <= 20.0]
 
-            sos_count = len(sos_timestamps)
-            if sos_count < 15:
-                dynamic_threat_level = "LOW"
-            elif 15 <= sos_count <= 45:
-                dynamic_threat_level = "MODERATE"
-            elif 46 <= sos_count <= 90:
-                dynamic_threat_level = "HIGH"
-            else:
-                dynamic_threat_level = "CRITICAL"
-
-            # Real-time debug prediction output
-            print(f"Debug - Gesture: {prediction} | Confidence: {confidence:.2f} | SOS Window (20s): {sos_count} frames | Threat Level: {dynamic_threat_level}")
-
-            # Calculate and draw bounding box
-            h, w, _ = frame.shape
-            x_coords = [int(lm.x * w) for lm in hand]
-            y_coords = [int(lm.y * h) for lm in hand]
-            x_min, x_max = min(x_coords), max(x_coords)
-            y_min, y_max = min(y_coords), max(y_coords)
-
-            padding = 20
-            x1 = max(0, x_min - padding)
-            y1 = max(0, y_min - padding)
-            x2 = min(w, x_max + padding)
-            y2 = min(h, y_max + padding)
-
-            box_color = (0, 0, 255) if prediction == "SOS" else (0, 255, 0)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-
-            # Draw hand landmarks
-            for landmark in hand:
-                px = int(landmark.x * w)
-                py = int(landmark.y * h)
-                cv2.circle(frame, (px, py), 5, (0, 255, 0), -1)
-
-            # Send Alert on SOS Gesture (with Snapshot)
-            if (
-                prediction == "SOS"
-                and confidence > 0.40
-                and (current_time - last_alert_time >= COOLDOWN_SECONDS)
-            ):
-                try:
-                    _, buffer = cv2.imencode('.jpg', frame)
-                    snapshot_b64 = base64.b64encode(buffer).decode('utf-8')
-
-                    status_code = send_gesture_alert(
-                        prediction,
-                        confidence=confidence,
-                        dynamic_threat_level=dynamic_threat_level,
-                        snapshot_b64=snapshot_b64
-                    )
-                    if status_code in (200, 201):
-                        last_alert_time = current_time
-                        current_threat_level = dynamic_threat_level
-                        if current_threat_level in ["HIGH", "CRITICAL"]:
-                            threading.Thread(
-                                target=send_telegram_alert,
-                                args=("Gesture Emergency Detected", current_threat_level, 23.8769, 90.3204, snapshot_b64),
-                                daemon=True
-                            ).start()
-                except Exception as e:
-                    print(f"[ALERT ERROR] Error during gesture alert trigger: {e}")
+        sos_count = len(sos_timestamps)
+        if sos_count < 15:
+            dynamic_threat_level = "LOW"
+        elif 15 <= sos_count <= 45:
+            dynamic_threat_level = "MODERATE"
+        elif 46 <= sos_count <= 90:
+            dynamic_threat_level = "HIGH"
         else:
-            sos_count = len(sos_timestamps)
-            if sos_count < 15:
-                dynamic_threat_level = "LOW"
-            elif 15 <= sos_count <= 45:
-                dynamic_threat_level = "MODERATE"
-            elif 46 <= sos_count <= 90:
-                dynamic_threat_level = "HIGH"
+            dynamic_threat_level = "CRITICAL"
+
+        print(f"Debug - Gesture: {prediction} | Confidence: {confidence:.2f} | SOS Window (20s): {sos_count} frames | Threat Level: {dynamic_threat_level}")
+
+        h, w, _ = frame.shape
+        x_coords = [int(lm.x * w) for lm in hand]
+        y_coords = [int(lm.y * h) for lm in hand]
+        x_min, x_max = min(x_coords), max(x_coords)
+        y_min, y_max = min(y_coords), max(y_coords)
+
+        padding = 20
+        x1 = max(0, x_min - padding)
+        y1 = max(0, y_min - padding)
+        x2 = min(w, x_max + padding)
+        y2 = min(h, y_max + padding)
+
+        box_color = (0, 0, 255) if prediction == "SOS" else (0, 255, 0)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+
+        for landmark in hand:
+            px = int(landmark.x * w)
+            py = int(landmark.y * h)
+            cv2.circle(frame, (px, py), 5, (0, 255, 0), -1)
+
+        # Trigger alert on confirmed SOS
+        if (
+            prediction == "SOS"
+            and confidence > 0.40
+            and (current_time - last_alert_time >= COOLDOWN_SECONDS)
+        ):
+            try:
+                _, buffer = cv2.imencode('.jpg', frame)
+                snapshot_b64 = base64.b64encode(buffer).decode('utf-8')
+
+                status_code = send_gesture_alert(
+                    prediction,
+                    confidence=confidence,
+                    dynamic_threat_level=dynamic_threat_level,
+                    snapshot_b64=snapshot_b64
+                )
+                if status_code in (200, 201):
+                    last_alert_time = current_time
+                    current_threat_level = dynamic_threat_level
+                    if current_threat_level in ["HIGH", "CRITICAL"]:
+                        threading.Thread(
+                            target=send_telegram_alert,
+                            args=("Gesture Emergency Detected", current_threat_level, 23.8769, 90.3204, snapshot_b64),
+                            daemon=True
+                        ).start()
+            except Exception as e:
+                print(f"[ALERT ERROR] Error during gesture alert trigger: {e}")
+    else:
+        sos_count = len(sos_timestamps)
+        if sos_count < 15:
+            dynamic_threat_level = "LOW"
+        elif 15 <= sos_count <= 45:
+            dynamic_threat_level = "MODERATE"
+        elif 46 <= sos_count <= 90:
+            dynamic_threat_level = "HIGH"
+        else:
+            dynamic_threat_level = "CRITICAL"
+
+    # Display HUD text overlays
+    text_color = (0, 0, 255) if "SOS" in prediction_text else (0, 255, 0)
+    cv2.putText(
+        frame,
+        f"{prediction_text} | Threat: {dynamic_threat_level} ({len(sos_timestamps)})",
+        (30, 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        text_color,
+        2
+    )
+
+    cv2.putText(
+        frame,
+        f"AI Stream Live | Port: {SERVER_PORT} | Mode: {INPUT_SOURCE.upper()}",
+        (30, 90),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
+
+    ret_enc, buffer = cv2.imencode('.jpg', frame)
+    if ret_enc:
+        with frame_lock:
+            latest_frame_jpeg = buffer.tobytes()
+
+    return {
+        "gesture": prediction,
+        "confidence": round(confidence, 2),
+        "threat_level": dynamic_threat_level,
+        "sos_window_count": len(sos_timestamps)
+    }
+
+
+def process_gestures():
+    """Continuous headless gesture detection worker thread."""
+    global last_alert_time, sos_timestamps, latest_frame_jpeg
+    print(f"\n[GESTURE] Background stream processor active (Connecting to {CAMERA_URL})...\n")
+
+    while True:
+        try:
+            ret, frame = fetch_camera_frame()
+            if ret and frame is not None:
+                process_gesture_frame(frame)
+                time.sleep(0.03)
             else:
-                dynamic_threat_level = "CRITICAL"
+                time.sleep(0.3)
+        except Exception:
+            time.sleep(0.3)
 
-        # Display result overlays
-        text_color = (0, 0, 255) if "SOS" in prediction_text else (0, 255, 0)
-        cv2.putText(
-            frame,
-            f"{prediction_text} | Threat: {dynamic_threat_level} ({len(sos_timestamps)})",
-            (30, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.85,
-            text_color,
-            2
-        )
 
-        cv2.putText(
-            frame,
-            "AI Stream Live | Port: 5000",
-            (30, 90),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2
-        )
+# ==========================================
+# CLIENT-SIDE API FRAME INGESTION ROUTES
+# ==========================================
 
-        ret_enc, buffer = cv2.imencode('.jpg', frame)
-        if ret_enc:
-            with frame_lock:
-                latest_frame_jpeg = buffer.tobytes()
+@app.route("/api/gesture/frame", methods=["POST"])
+@app.route("/api/upload_frame", methods=["POST"])
+@app.route("/detect_gesture", methods=["POST"])
+def api_upload_frame():
+    """
+    Client-side API endpoint for cloud deployment.
+    Accepts video frames as multipart file ('file' or 'frame'), raw binary image, or JSON base64.
+    """
+    raw_bytes = None
+    if 'file' in request.files:
+        raw_bytes = request.files['file'].read()
+    elif 'frame' in request.files:
+        raw_bytes = request.files['frame'].read()
+    elif request.is_json:
+        data = request.get_json()
+        b64_str = data.get('frame') or data.get('image') or data.get('snapshot_b64')
+        if b64_str:
+            if "," in b64_str:
+                b64_str = b64_str.split(",", 1)[1]
+            try:
+                raw_bytes = base64.b64decode(b64_str)
+            except Exception as e:
+                return jsonify({"status": "error", "message": f"Invalid base64 encoding: {e}"}), 400
+    else:
+        body = request.get_data()
+        if body:
+            raw_bytes = body
 
-        time.sleep(0.03)
+    if not raw_bytes:
+        return jsonify({"status": "error", "message": "No frame payload provided"}), 400
+
+    img_arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+    if frame is None or frame.size == 0:
+        return jsonify({"status": "error", "message": "Could not decode frame image bytes"}), 400
+
+    result = process_gesture_frame(frame)
+    return jsonify({
+        "status": "success",
+        "input_source": INPUT_SOURCE,
+        **result
+    })
+
+
+@app.route("/status", methods=["GET"])
+def api_status():
+    return jsonify({
+        "status": "ONLINE",
+        "service": "AEGIS Hand Gesture Landmark Sensor",
+        "input_source": INPUT_SOURCE,
+        "port": SERVER_PORT,
+        "camera_url": CAMERA_URL,
+        "sos_window_count": len(sos_timestamps)
+    })
 
 
 def generate_frames():
@@ -496,15 +593,18 @@ def cleanup():
 # ==========================================
 
 if __name__ == "__main__":
-    print("\n" + "=" * 55)
-    print("Flask Gesture Detection Server starting on http://0.0.0.0:5000")
-    print("Headless Background Gesture Processor Active")
-    print("Direct Browser URL: http://localhost:5000")
-    print("Direct Stream Feed: http://localhost:5000/video_feed")
+    print("\n" + "=" * 65)
+    print("AEGIS AI HAND GESTURE LANDMARK SENSOR")
+    source_label = "CLIENT-SIDE APIS (Cloud Mode)" if INPUT_SOURCE == "api" else "LOCAL HARDWARE STREAM"
+    print(f"Input Source:       {INPUT_SOURCE.upper()} - {source_label}")
+    print(f"Server Endpoint:    http://{SERVER_HOST}:{SERVER_PORT}")
+    print(f"Direct Stream Feed: http://localhost:{SERVER_PORT}/video_feed")
+    print(f"Client API Upload:  POST http://localhost:{SERVER_PORT}/api/gesture/frame")
+    print(f"Telemetry API:      GET  http://localhost:{SERVER_PORT}/status")
     print("Press Ctrl+C to stop the server.")
-    print("=" * 55 + "\n")
+    print("=" * 65 + "\n")
 
     # Launch continuous headless gesture processing thread
-    threading.Thread(target=process_gestures, daemon=True).start()
+    threading.Thread(target=process_gestures, daemon=True, name="GestureStreamWorker").start()
 
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False, threaded=True)

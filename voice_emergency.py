@@ -1,11 +1,21 @@
 import os
 import sys
+import io
 import time
 import base64
+import argparse
 import threading
+from typing import Optional
 import requests
-import sounddevice as sd
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
 import speech_recognition as sr
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uvicorn
 
 # Ensure Windows terminal handles UTF-8 emojis without charmap encoding errors
 if sys.platform == "win32":
@@ -14,6 +24,27 @@ if sys.platform == "win32":
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+# ==========================================
+# CLI ARGUMENT PARSING
+# ==========================================
+
+parser = argparse.ArgumentParser(description="AEGIS AI Emergency Voice Detector")
+parser.add_argument(
+    "--input-source",
+    type=str,
+    default=os.environ.get("INPUT_SOURCE", "hardware"),
+    choices=["hardware", "api", "cloud"],
+    help="Input source mode: 'hardware' (local microphone) or 'api'/'cloud' (client-side audio API)"
+)
+parser.add_argument("--port", type=int, default=8003, help="Port to run voice detection API server on (default: 8003)")
+parser.add_argument("--host", type=str, default=os.environ.get("HOST", "0.0.0.0"), help="Host address to bind to (default: 0.0.0.0)")
+
+cli_args, _ = parser.parse_known_args()
+
+INPUT_SOURCE = "api" if cli_args.input_source.lower() in ["api", "cloud", "client"] else "hardware"
+SERVER_HOST = cli_args.host
+SERVER_PORT = cli_args.port
 
 # ==========================================
 # CONFIGURATION & ALERT COOLDOWN
@@ -183,128 +214,246 @@ def send_telegram_alert(alert_type, threat_level, lat, lon, image_b64=None):
         return False
 
 
+recognizer = sr.Recognizer()
+
+
+def process_audio_data(audio_data: sr.AudioData) -> dict:
+    """
+    Transcribes audio data, evaluates emergency keyword threat tiers,
+    and dispatches alerts to backend and Telegram with optical camera snapshot.
+    """
+    global last_alert_time
+
+    try:
+        transcript = recognizer.recognize_google(audio_data)
+        transcript_clean = transcript.lower().strip()
+        print(f"🗣️ Transcribed Speech: \"{transcript}\"")
+
+        recognized_keyword, dynamic_threat = evaluate_voice_threat(transcript_clean)
+        alert_dispatched = False
+
+        if recognized_keyword:
+            print(f"🚨 EMERGENCY SPEECH DETECTED! Keyword: '{recognized_keyword}' | Threat Level: {dynamic_threat}")
+            current_time = time.time()
+
+            if current_time - last_alert_time >= COOLDOWN_SECONDS:
+                print("📸 Fetching live optical snapshot from Shared Camera Server...")
+                snapshot_b64, snapshot_err = capture_snapshot_with_retry(timeout=2.0, max_retries=2)
+
+                if snapshot_b64:
+                    print(f"✅ [SNAPSHOT CONFIRMED] Live image captured & base64 encoded ({len(snapshot_b64)} chars).")
+                else:
+                    print(f"🚨 [CRITICAL ERROR] Snapshot fetch failed: {snapshot_err}. Proceeding without snapshot.")
+
+                raw_data = {
+                    "transcript": transcript,
+                    "keyword": recognized_keyword,
+                    "threat_level": dynamic_threat,
+                    "sensor": "Speech Recognition Microphone (API)" if INPUT_SOURCE == "api" else "Speech Recognition Microphone"
+                }
+
+                payload = {
+                    "title": f"Voice Distress Detected: {recognized_keyword}",
+                    "threat_level": dynamic_threat,
+                    "detection_source": "AI_VOICE_SENSOR",
+                    "latitude": 23.8769,
+                    "longitude": 90.3204,
+                    "location_name": "Daffodil Smart City - Ashulia, Dhaka",
+                    "description": f"Emergency voice command detected in audio stream: '{transcript}' [Threat: {dynamic_threat}]",
+                    "raw_detection_data": raw_data,
+                    "snapshot_b64": snapshot_b64,
+                    "send_sms": False
+                }
+
+                try:
+                    response = requests.post(BACKEND_ALERT_URL, json=payload, timeout=2.5)
+                    if response.status_code == 201:
+                        last_alert_time = current_time
+                        alert_dispatched = True
+                        alert_id = response.json().get('id', 'N/A')
+                        print(f"✅ [SUCCESS] Emergency voice alert delivered to backend! (Alert #{alert_id} | Threat: {dynamic_threat} | Status: 201)")
+
+                        alert_type_desc = f"Voice Distress ({recognized_keyword})"
+                        threading.Thread(
+                            target=send_telegram_alert,
+                            args=(alert_type_desc, dynamic_threat, 23.8769, 90.3204, snapshot_b64),
+                            daemon=True
+                        ).start()
+                    else:
+                        print(f"⚠️ [WARNING] Backend returned status {response.status_code}: {response.text}")
+                except Exception as req_err:
+                    print(f"❌ [ALERT ERROR] Failed to send voice alert to backend: {req_err}")
+            else:
+                cooldown_remaining = int(COOLDOWN_SECONDS - (current_time - last_alert_time))
+                print(f"⏳ Cooldown active ({cooldown_remaining}s remaining). Alert suppressed.")
+
+        return {
+            "transcript": transcript,
+            "recognized_keyword": recognized_keyword,
+            "threat_level": dynamic_threat,
+            "alert_dispatched": alert_dispatched
+        }
+
+    except sr.UnknownValueError:
+        return {
+            "transcript": "",
+            "recognized_keyword": None,
+            "threat_level": None,
+            "alert_dispatched": False,
+            "detail": "No clear speech recognized in audio segment"
+        }
+    except sr.RequestError as e:
+        return {"error": f"Speech recognition service error: {e}"}
+
+
+# ==========================================
+# FASTAPI APPLICATION (CLIENT-SIDE API MODE)
+# ==========================================
+
+voice_app = FastAPI(
+    title="AEGIS Emergency Voice Detection API",
+    description="Client-side audio ingestion API for cloud deployment.",
+    version="3.0.0"
+)
+
+voice_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class AudioUploadPayload(BaseModel):
+    audio_b64: Optional[str] = None
+    audio: Optional[str] = None
+    sample_rate: Optional[int] = 16000
+
+
+@voice_app.get("/status", summary="Voice Sensor Status")
+def get_voice_status():
+    return {
+        "status": "ONLINE",
+        "service": "AEGIS AI Emergency Voice Detector",
+        "input_source": INPUT_SOURCE,
+        "port": SERVER_PORT,
+        "backend_url": BACKEND_ALERT_URL,
+        "camera_server_url": CAMERA_SERVER_URL
+    }
+
+
+@voice_app.post("/api/voice/audio", summary="Upload Audio from Client-Side API")
+@voice_app.post("/api/voice/detect", summary="Upload Audio from Client-Side API")
+@voice_app.post("/upload_audio", summary="Upload Audio from Client-Side API")
+async def api_upload_audio(
+    file: Optional[UploadFile] = File(None),
+    payload: Optional[AudioUploadPayload] = None,
+    request: Request = None
+):
+    """
+    Client-side API endpoint for cloud deployment.
+    Accepts audio via multipart file ('file' or 'audio'), raw binary WAV/PCM, or JSON base64.
+    """
+    raw_bytes = None
+    sample_rate = 16000
+
+    if file:
+        raw_bytes = await file.read()
+    elif payload and (payload.audio_b64 or payload.audio):
+        b64_str = payload.audio_b64 or payload.audio
+        if "," in b64_str:
+            b64_str = b64_str.split(",", 1)[1]
+        try:
+            raw_bytes = base64.b64decode(b64_str)
+            if payload.sample_rate:
+                sample_rate = payload.sample_rate
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 audio encoding: {e}")
+    elif request:
+        body = await request.body()
+        if body:
+            try:
+                import json
+                data = json.loads(body)
+                b64_cand = data.get("audio_b64") or data.get("audio")
+                if b64_cand:
+                    if "," in b64_cand:
+                        b64_cand = b64_cand.split(",", 1)[1]
+                    raw_bytes = base64.b64decode(b64_cand)
+                    if "sample_rate" in data:
+                        sample_rate = int(data["sample_rate"])
+            except Exception:
+                raw_bytes = body
+
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="No audio payload provided.")
+
+    # Parse container (WAV) or raw PCM
+    try:
+        with sr.AudioFile(io.BytesIO(raw_bytes)) as source:
+            audio_data = recognizer.record(source)
+    except Exception:
+        # Fall back to raw 16-bit PCM (sample_rate, 2 bytes per sample)
+        audio_data = sr.AudioData(raw_bytes, sample_rate, 2)
+
+    result = process_audio_data(audio_data)
+    return {
+        "status": "success",
+        "input_source": INPUT_SOURCE,
+        **result
+    }
+
+
 def main():
     global last_alert_time
 
-    print("===================================")
-    print("   AI EMERGENCY VOICE DETECTOR")
-    print("===================================")
-    print(f"Backend Target: {BACKEND_ALERT_URL}")
+    print("\n" + "=" * 65)
+    print("AEGIS AI EMERGENCY VOICE DETECTOR")
+    source_label = "CLIENT-SIDE APIS (Cloud Mode)" if INPUT_SOURCE == "api" else "LOCAL HARDWARE MICROPHONE"
+    print(f"Input Source:    {INPUT_SOURCE.upper()} - {source_label}")
+    print(f"Backend Target:  {BACKEND_ALERT_URL}")
     print(f"Cooldown Period: {COOLDOWN_SECONDS}s")
     print("Threat Tiers:")
     print("  - CRITICAL:", ", ".join(CRITICAL_KEYWORDS))
     print("  - HIGH:    ", ", ".join(HIGH_KEYWORDS))
     print("  - LOW:     ", ", ".join(LOW_KEYWORDS))
-    print("\n🎧 Continuous microphone listening active (Press Ctrl+C to stop)...")
+    print("=" * 65 + "\n")
 
-    duration = 4
-    sample_rate = 16000
+    if INPUT_SOURCE == "api":
+        print(f"Listening for client-side audio payloads on http://{SERVER_HOST}:{SERVER_PORT}/api/voice/audio ...")
+        uvicorn.run(voice_app, host=SERVER_HOST, port=SERVER_PORT, log_level="info")
+    else:
+        if sd is None:
+            print("❌ sounddevice is not available or audio device is missing.")
+            print("💡 For cloud deployment without microphones, run with: --input-source api")
+            sys.exit(1)
 
-    recognizer = sr.Recognizer()
+        print("\n🎧 Continuous microphone listening active (Press Ctrl+C to stop)...")
+        duration = 4
+        sample_rate = 16000
 
-    while True:
-        try:
-            current_time = time.time()
-            print("\n🎤 Listening for voice (4 seconds)...")
-            
-            # Record audio from default microphone
-            audio = sd.rec(
-                int(duration * sample_rate),
-                samplerate=sample_rate,
-                channels=1,
-                dtype="int16"
-            )
-            sd.wait()
-
-            # Convert audio to SpeechRecognition format
-            audio_bytes = audio.tobytes()
-            audio_data = sr.AudioData(audio_bytes, sample_rate, 2)
-
+        while True:
             try:
-                transcript = recognizer.recognize_google(audio_data)
-                transcript_clean = transcript.lower().strip()
+                print("\n🎤 Listening for voice (4 seconds)...")
+                audio = sd.rec(
+                    int(duration * sample_rate),
+                    samplerate=sample_rate,
+                    channels=1,
+                    dtype="int16"
+                )
+                sd.wait()
 
-                print(f"🗣️ You said: \"{transcript}\"")
+                audio_bytes = audio.tobytes()
+                audio_data = sr.AudioData(audio_bytes, sample_rate, 2)
+                process_audio_data(audio_data)
 
-                # Dynamically evaluate threat level and recognized keyword
-                recognized_keyword, dynamic_threat = evaluate_voice_threat(transcript_clean)
-
-                if recognized_keyword:
-                    print(f"🚨 EMERGENCY SPEECH DETECTED! Keyword: '{recognized_keyword}' | Threat Level: {dynamic_threat}")
-
-                    # Check cooldown to prevent API spamming
-                    if current_time - last_alert_time >= COOLDOWN_SECONDS:
-                        # 1. Attempt to capture and confirm snapshot with retries
-                        print("📸 Fetching live optical snapshot from Shared Camera Server...")
-                        snapshot_b64, snapshot_err = capture_snapshot_with_retry(timeout=2.0, max_retries=2)
-
-                        if snapshot_b64:
-                            print(f"✅ [SNAPSHOT CONFIRMED] Live image captured & base64 encoded ({len(snapshot_b64)} chars).")
-                        else:
-                            print(f"🚨 [CRITICAL ERROR] Snapshot fetch failed from Shared Camera Server: {snapshot_err}")
-                            print("⚠️ Proceeding to transmit voice alert without snapshot as required.")
-
-                        # 2. Build payload ONLY after snapshot is confirmed or failed
-                        raw_data = {
-                            "transcript": transcript,
-                            "keyword": recognized_keyword,
-                            "threat_level": dynamic_threat,
-                            "sensor": "Speech Recognition Microphone"
-                        }
-
-                        payload = {
-                            "title": f"Voice Distress Detected: {recognized_keyword}",
-                            "threat_level": dynamic_threat,
-                            "detection_source": "AI_VOICE_SENSOR",
-                            "latitude": 23.8769,
-                            "longitude": 90.3204,
-                            "location_name": "Daffodil Smart City - Ashulia, Dhaka",
-                            "description": f"Emergency voice command detected in audio stream: '{transcript}' [Threat: {dynamic_threat}]",
-                            "raw_detection_data": raw_data,
-                            "snapshot_b64": snapshot_b64,
-                            "send_sms": False
-                        }
-
-                        # 3. Transmit confirmed payload to backend
-                        try:
-                            response = requests.post(BACKEND_ALERT_URL, json=payload, timeout=2.5)
-                            if response.status_code == 201:
-                                last_alert_time = current_time
-                                alert_id = response.json().get('id', 'N/A')
-                                snapshot_status = f"Attached ({len(snapshot_b64)} chars)" if snapshot_b64 else "None (Camera Busy)"
-                                print(f"✅ [SUCCESS] Emergency alert sent to backend! (Alert #{alert_id} | Threat: {dynamic_threat} | Snapshot: {snapshot_status} | Status: 201 Created)")
-
-                                # 4. Dispatch Telegram mobile alert in non-blocking background thread
-                                print("📱 Forwarding emergency alert to Telegram mobile bot...")
-                                alert_type_desc = f"Voice Distress ({recognized_keyword})"
-                                threading.Thread(
-                                    target=send_telegram_alert,
-                                    args=(alert_type_desc, dynamic_threat, 23.8769, 90.3204, snapshot_b64),
-                                    daemon=True
-                                ).start()
-                            else:
-                                print(f"⚠️ [WARNING] Backend responded with status {response.status_code}: {response.text}")
-                        except requests.exceptions.RequestException as req_err:
-                            print(f"❌ [ALERT ERROR] Failed to send voice alert to backend: {req_err}")
-                    else:
-                        cooldown_remaining = int(COOLDOWN_SECONDS - (current_time - last_alert_time))
-                        print(f"⏳ Cooldown active ({cooldown_remaining}s remaining). Alert suppressed.")
-
-                else:
-                    print("✅ No emergency keyword detected.")
-
-            except sr.UnknownValueError:
-                # Silence or unrecognised audio segment
-                print("🔇 (No speech detected)")
-            except sr.RequestError as e:
-                print(f"❌ Speech recognition service error: {e}")
-
-        except KeyboardInterrupt:
-            print("\n🛑 Stopping AI Emergency Voice Detector.")
-            break
-        except Exception as err:
-            print(f"⚠️ Audio processing error: {err}")
-            time.sleep(1)
+            except KeyboardInterrupt:
+                print("\n🛑 Stopping AI Emergency Voice Detector.")
+                break
+            except Exception as err:
+                print(f"⚠️ Audio processing error: {err}")
+                time.sleep(1)
 
 
 if __name__ == "__main__":

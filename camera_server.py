@@ -37,7 +37,7 @@ if sys.platform == "win32":
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -60,11 +60,20 @@ def parse_camera_source(source_val):
 
 parser = argparse.ArgumentParser(description="AEGIS Single Camera Video Server")
 parser.add_argument("--port", type=int, default=8001, help="Port to run the camera server on (default: 8001)")
+parser.add_argument("--host", type=str, default=os.environ.get("HOST", "0.0.0.0"), help="Host address to bind to (default: 0.0.0.0)")
 parser.add_argument("--source", type=str, default="0", help="Camera source (webcam index like 0, or URL, default: 0)")
+parser.add_argument(
+    "--input-source",
+    type=str,
+    default=os.environ.get("INPUT_SOURCE", "hardware"),
+    choices=["hardware", "api", "cloud"],
+    help="Toggle input source: 'hardware' (local webcam) or 'api'/'cloud' (client-side API ingestion)"
+)
 
 cli_args, _ = parser.parse_known_args()
 
-SERVER_HOST = "127.0.0.1"
+INPUT_SOURCE = "api" if cli_args.input_source.lower() in ["api", "cloud", "client"] else "hardware"
+SERVER_HOST = cli_args.host
 SERVER_PORT = cli_args.port
 CAMERA_SOURCE = parse_camera_source(cli_args.source)
 FRAME_WIDTH = 1280
@@ -182,12 +191,86 @@ def apply_filter(frame: np.ndarray, filter_mode: str) -> np.ndarray:
 # CONTINUOUS HARDWARE CAPTURE LOOP
 # =============================================================================
 
+frame_timestamps = []
+
+
+def ingest_client_frame(raw_frame: np.ndarray) -> bool:
+    """
+    Ingests and processes a frame received via client-side API for cloud deployment.
+    Applies current digital PTZ and active tactical vision filters, updating live telemetry.
+    """
+    global latest_frame, latest_jpeg, latest_b64, latest_brightness
+    global latest_timestamp, current_fps, current_mbps, frame_count
+
+    if raw_frame is None or raw_frame.size == 0:
+        return False
+
+    now = time.time()
+    brightness = float(cv2.mean(raw_frame)[0])
+
+    # Moving window timestamp-based FPS counter (last 10 frames)
+    frame_timestamps.append(now)
+    if len(frame_timestamps) > 10:
+        frame_timestamps.pop(0)
+
+    calc_fps = 0.0
+    if len(frame_timestamps) >= 2:
+        time_window = frame_timestamps[-1] - frame_timestamps[0]
+        if time_window > 0:
+            calc_fps = round((len(frame_timestamps) - 1) / time_window, 1)
+
+    # Snapshot active PTZ & filter settings
+    with frame_lock:
+        cur_zoom = ZOOM_LEVEL
+        cur_pan = PAN_X
+        cur_tilt = TILT_Y
+        cur_filter = CAMERA_FILTER
+
+    # Apply PTZ and Filters
+    processed = apply_ptz(raw_frame, cur_zoom, cur_pan, cur_tilt)
+    processed = apply_filter(processed, cur_filter)
+
+    # Encode to JPEG
+    ret_enc, buffer = cv2.imencode('.jpg', processed, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+    if not ret_enc or buffer is None:
+        return False
+
+    # Bandwidth calculation: (bytes * fps * 8) / 1_000_000
+    frame_bytes = len(buffer)
+    calc_mbps = round((frame_bytes * calc_fps * 8) / 1_000_000, 2)
+    jpeg_bytes = buffer.tobytes()
+    b64_str = base64.b64encode(buffer).decode('utf-8')
+
+    with frame_lock:
+        latest_frame = processed
+        latest_jpeg = jpeg_bytes
+        latest_b64 = b64_str
+        latest_brightness = brightness
+        latest_timestamp = now
+        current_fps = calc_fps
+        current_mbps = calc_mbps
+        frame_count += 1
+
+    return True
+
+
 def capture_loop():
-    """Background thread continuously fetching frames, applying PTZ/filters, and caching JPEG."""
+    """Background thread continuously fetching frames in hardware mode, or idling in API mode."""
     global cap, latest_frame, latest_jpeg, latest_b64, latest_brightness
     global latest_timestamp, current_fps, current_mbps, frame_count, is_running
 
-    print(f"\n[CAMERA SERVER] Initializing video capture (Source: {CAMERA_SOURCE})...")
+    if INPUT_SOURCE == "api":
+        print("\n" + "=" * 65)
+        print("[CAMERA SERVER] Input Source: CLIENT-SIDE APIS (Cloud Deployment Mode)")
+        print("[CAMERA SERVER] Hardware webcam disabled. Listening for client frames via:")
+        print("  - POST /api/camera/frame")
+        print("  - POST /api/upload_frame")
+        print("=" * 65 + "\n")
+        while is_running:
+            time.sleep(1.0)
+        return
+
+    print(f"\n[CAMERA SERVER] Input Source: LOCAL HARDWARE (Source: {CAMERA_SOURCE})...")
     cap = create_video_capture(CAMERA_SOURCE)
 
     if cap and cap.isOpened():
@@ -198,8 +281,6 @@ def capture_loop():
         print(f"[CAMERA SERVER] Hardware camera connected successfully.\n")
     else:
         print(f"[CAMERA SERVER WARNING] Failed to connect to camera source: {CAMERA_SOURCE}. Will retry in background...\n")
-
-    frame_timestamps = []
 
     while is_running:
         if cap is None or not cap.isOpened():
@@ -227,52 +308,7 @@ def capture_loop():
 
         # Horizontally flip frame to fix left-right mirror reversal
         raw_frame = cv2.flip(raw_frame, 1)
-
-        now = time.time()
-        brightness = float(cv2.mean(raw_frame)[0])
-
-        # Moving window timestamp-based FPS counter (last 10 frames)
-        frame_timestamps.append(now)
-        if len(frame_timestamps) > 10:
-            frame_timestamps.pop(0)
-
-        calc_fps = 0.0
-        if len(frame_timestamps) >= 2:
-            time_window = frame_timestamps[-1] - frame_timestamps[0]
-            if time_window > 0:
-                calc_fps = round((len(frame_timestamps) - 1) / time_window, 1)
-
-        # Snapshot active PTZ & filter settings
-        with frame_lock:
-            cur_zoom = ZOOM_LEVEL
-            cur_pan = PAN_X
-            cur_tilt = TILT_Y
-            cur_filter = CAMERA_FILTER
-
-        # Apply PTZ and Filters
-        processed = apply_ptz(raw_frame, cur_zoom, cur_pan, cur_tilt)
-        processed = apply_filter(processed, cur_filter)
-
-        # Encode to JPEG
-        ret_enc, buffer = cv2.imencode('.jpg', processed, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        if not ret_enc or buffer is None:
-            continue
-
-        # Bandwidth calculation: (bytes * fps * 8) / 1_000_000
-        frame_bytes = len(buffer)
-        calc_mbps = round((frame_bytes * calc_fps * 8) / 1_000_000, 2)
-        jpeg_bytes = buffer.tobytes()
-        b64_str = base64.b64encode(buffer).decode('utf-8')
-
-        with frame_lock:
-            latest_frame = processed
-            latest_jpeg = jpeg_bytes
-            latest_b64 = b64_str
-            latest_brightness = brightness
-            latest_timestamp = now
-            current_fps = calc_fps
-            current_mbps = calc_mbps
-            frame_count += 1
+        ingest_client_frame(raw_frame)
 
 
 # =============================================================================
@@ -403,10 +439,15 @@ def get_status():
     """Returns real-time hardware telemetry (FPS, Mbps, quality, PTZ coordinates)."""
     now = time.time()
     with frame_lock:
-        is_online = bool(cap and cap.isOpened() and latest_timestamp and (now - latest_timestamp < 4.0))
+        if INPUT_SOURCE == "api":
+            is_online = bool(latest_timestamp and (now - latest_timestamp < 10.0))
+        else:
+            is_online = bool(cap and cap.isOpened() and latest_timestamp and (now - latest_timestamp < 4.0))
+
         return {
             "status": "ONLINE" if is_online else "OFFLINE",
-            "source": str(CAMERA_SOURCE),
+            "input_source": INPUT_SOURCE,
+            "source": "client_api" if INPUT_SOURCE == "api" else str(CAMERA_SOURCE),
             "port": SERVER_PORT,
             "fps": current_fps,
             "mbps": current_mbps,
@@ -420,6 +461,80 @@ def get_status():
             "pan": PAN_X,
             "tilt": TILT_Y
         }
+
+
+# =============================================================================
+# CLIENT-SIDE API FRAME INGESTION (CLOUD DEPLOYMENT MODE)
+# =============================================================================
+
+class FrameUploadPayload(BaseModel):
+    frame: Optional[str] = None
+    image: Optional[str] = None
+    snapshot_b64: Optional[str] = None
+
+
+@app.post("/api/upload_frame", summary="Upload Frame from Client-Side API")
+@app.post("/api/camera/frame", summary="Upload Frame from Client-Side API")
+@app.post("/upload_frame", summary="Upload Frame from Client-Side API")
+async def upload_frame(
+    file: Optional[UploadFile] = File(None),
+    payload: Optional[FrameUploadPayload] = None,
+    request: Request = None
+):
+    """
+    Receives video frames from client-side APIs for cloud deployment.
+    Accepts:
+      - Multipart form-data with file ('file' or 'frame')
+      - Application/json with base64 encoded frame ('frame', 'image', or 'snapshot_b64')
+      - Raw binary image (image/jpeg, image/png) in request body
+    """
+    raw_bytes = None
+    if file:
+        raw_bytes = await file.read()
+    elif payload and (payload.frame or payload.image or payload.snapshot_b64):
+        b64_str = payload.frame or payload.image or payload.snapshot_b64
+        if "," in b64_str:
+            b64_str = b64_str.split(",", 1)[1]
+        try:
+            raw_bytes = base64.b64decode(b64_str)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 frame encoding: {e}")
+    elif request:
+        body = await request.body()
+        if body:
+            try:
+                import json
+                data = json.loads(body)
+                b64_cand = data.get("frame") or data.get("image") or data.get("snapshot_b64")
+                if b64_cand:
+                    if "," in b64_cand:
+                        b64_cand = b64_cand.split(",", 1)[1]
+                    raw_bytes = base64.b64decode(b64_cand)
+            except Exception:
+                raw_bytes = body
+
+    if not raw_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="No frame payload provided. Submit multipart 'file', JSON {'frame': '<base64>'}, or raw binary image."
+        )
+
+    img_arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+    raw_frame = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+    if raw_frame is None or raw_frame.size == 0:
+        raise HTTPException(status_code=400, detail="Could not decode image bytes into valid OpenCV frame.")
+
+    success = ingest_client_frame(raw_frame)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to process and encode frame.")
+
+    return {
+        "status": "success",
+        "message": "Frame ingested into camera pipeline",
+        "frame_number": frame_count,
+        "input_source": INPUT_SOURCE,
+        "fps": current_fps
+    }
 
 
 # =============================================================================

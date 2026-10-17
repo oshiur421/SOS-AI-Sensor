@@ -10,7 +10,8 @@ FROM python:3.11-slim
 # Prevent Python from writing .pyc files and buffer stdout/stderr for real-time logs
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    INPUT_SOURCE=api
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -39,11 +40,14 @@ COPY . .
 
 # Expose microservice ports:
 # - 8001: Central Camera Streaming & PTZ Server (FastAPI)
+# - 8002: Pose Fall Detection Server (FastAPI)
 # - 5000: Hand Gesture Landmark & Detection Server (Flask)
-EXPOSE 8001 5000
+# - 8003: Emergency Voice & Acoustic Monitor (FastAPI)
+EXPOSE 8001 8002 5000 8003
 
 # Set entry point to execute the master coordination script.
 # This script spawns and supervises all sensor microservices (camera_server.py,
 # fall_detection.py, test_landmark_gesture.py, and voice_emergency.py)
-# concurrently using subprocesses.
+# concurrently using subprocesses, honoring the configured --input-source.
 ENTRYPOINT ["python", "start_aegis.py"]
+CMD []
