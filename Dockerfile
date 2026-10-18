@@ -49,5 +49,4 @@ EXPOSE 8000
 
 # Set entry point to execute the master API Gateway orchestrator.
 # Spawns internal microservices and routes all external requests through the unified port.
-ENTRYPOINT ["python", "master.py"]
-CMD []
+CMD ["python", "master.py"]
