@@ -5,8 +5,18 @@ import time
 import base64
 import argparse
 import threading
+import subprocess
+import shutil
+import tempfile
+import wave
+import traceback
 from typing import Optional
 import requests
+try:
+    from pydub import AudioSegment
+    PYDUB_AVAILABLE = True
+except ImportError:
+    PYDUB_AVAILABLE = False
 try:
     import sounddevice as sd
 except Exception:
@@ -214,7 +224,132 @@ def send_telegram_alert(alert_type, threat_level, lat, lon, image_b64=None):
         return False
 
 
+def get_ffmpeg_binary() -> str:
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    for cand in [
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        os.environ.get("FFMPEG_PATH", ""),
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"
+    ]:
+        if cand and os.path.exists(cand):
+            return cand
+    return "ffmpeg"
+
+
+def transcode_to_pcm_wav(raw_bytes: bytes, target_sample_rate: int = 16000) -> Optional[bytes]:
+    """
+    Transcodes incoming audio bytes (WebM, OGG, Opus, AAC, MP4, WAV, etc.)
+    into standard 16-bit mono PCM WAV format (16kHz) for SpeechRecognition.
+    Uses pydub if available, otherwise executes an ffmpeg subprocess.
+    """
+    if not raw_bytes or len(raw_bytes) < 12:
+        print("⚠️ [AUDIO TRANSCODE] Received empty or truncated audio bytes.")
+        return None
+
+    # Check if raw_bytes is already valid 16-bit PCM WAV
+    try:
+        with io.BytesIO(raw_bytes) as bio:
+            with wave.open(bio, 'rb') as wf:
+                if wf.getsampwidth() == 2 and wf.getnchannels() == 1 and wf.getframerate() == target_sample_rate:
+                    return raw_bytes
+    except Exception:
+        pass
+
+    # Method 1: Try pydub if available
+    if PYDUB_AVAILABLE:
+        try:
+            seg = AudioSegment.from_file(io.BytesIO(raw_bytes))
+            seg = seg.set_frame_rate(target_sample_rate).set_channels(1).set_sample_width(2)
+            out_buf = io.BytesIO()
+            seg.export(out_buf, format="wav")
+            out_bytes = out_buf.getvalue()
+            if len(out_bytes) > 44:
+                print(f"✅ [AUDIO TRANSCODE] Pydub successfully converted {len(raw_bytes)} bytes to {len(out_bytes)} bytes WAV.")
+                return out_bytes
+        except Exception as pydub_err:
+            print(f"[AUDIO TRANSCODE] Pydub conversion failed ({pydub_err}), trying ffmpeg subprocess...")
+
+    ffmpeg_bin = get_ffmpeg_binary()
+
+    # Method 2: ffmpeg in-memory pipe (stdin -> stdout)
+    try:
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", "pipe:0",
+            "-ac", "1",
+            "-ar", str(target_sample_rate),
+            "-f", "wav",
+            "-acodec", "pcm_s16le",
+            "pipe:1"
+        ]
+        proc = subprocess.run(
+            cmd,
+            input=raw_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=8
+        )
+        if proc.returncode == 0 and len(proc.stdout) > 44:
+            print(f"✅ [AUDIO TRANSCODE] FFmpeg pipe converted {len(raw_bytes)} bytes to {len(proc.stdout)} bytes WAV.")
+            return proc.stdout
+    except Exception as pipe_err:
+        print(f"[AUDIO TRANSCODE] FFmpeg pipe skipped ({pipe_err}), attempting tempfile conversion...")
+
+    # Method 3: ffmpeg seekable tempfile conversion (handles non-seekable WebM/EBML streams)
+    in_tmp = None
+    out_tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".audio") as f_in:
+            f_in.write(raw_bytes)
+            in_tmp = f_in.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f_out:
+            out_tmp = f_out.name
+
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", in_tmp,
+            "-ac", "1",
+            "-ar", str(target_sample_rate),
+            "-f", "wav",
+            "-acodec", "pcm_s16le",
+            out_tmp
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+        if proc.returncode == 0 and os.path.exists(out_tmp) and os.path.getsize(out_tmp) > 44:
+            with open(out_tmp, "rb") as f_res:
+                wav_data = f_res.read()
+                print(f"✅ [AUDIO TRANSCODE] FFmpeg tempfile converted {len(raw_bytes)} bytes to {len(wav_data)} bytes WAV.")
+                return wav_data
+        else:
+            err_msg = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else "Unknown error"
+            print(f"❌ [FFMPEG ERROR] Transcoding failed (code {proc.returncode}): {err_msg}")
+    except Exception as tmp_err:
+        print(f"❌ [AUDIO TRANSCODE ERROR] Tempfile conversion exception: {tmp_err}")
+    finally:
+        for p in (in_tmp, out_tmp):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+    return None
+
+
 recognizer = sr.Recognizer()
+recognizer.energy_threshold = 300
+recognizer.dynamic_energy_threshold = True
 
 
 def process_audio_data(audio_data: sr.AudioData) -> dict:
@@ -224,16 +359,17 @@ def process_audio_data(audio_data: sr.AudioData) -> dict:
     """
     global last_alert_time
 
+    print("🔍 [SPEECH RECOGNITION] Decoding audio stream with Google Speech Recognizer...")
     try:
         transcript = recognizer.recognize_google(audio_data)
         transcript_clean = transcript.lower().strip()
-        print(f"🗣️ Transcribed Speech: \"{transcript}\"")
+        print(f"🗣️ [SPEECH DECODED] \"{transcript}\"")
 
         recognized_keyword, dynamic_threat = evaluate_voice_threat(transcript_clean)
         alert_dispatched = False
 
         if recognized_keyword:
-            print(f"🚨 EMERGENCY SPEECH DETECTED! Keyword: '{recognized_keyword}' | Threat Level: {dynamic_threat}")
+            print(f"🚨 [EMERGENCY VOICE DETECTED] Keyword: '{recognized_keyword}' | Threat Level: {dynamic_threat}")
             current_time = time.time()
 
             if current_time - last_alert_time >= COOLDOWN_SECONDS:
@@ -287,6 +423,9 @@ def process_audio_data(audio_data: sr.AudioData) -> dict:
                 cooldown_remaining = int(COOLDOWN_SECONDS - (current_time - last_alert_time))
                 print(f"⏳ Cooldown active ({cooldown_remaining}s remaining). Alert suppressed.")
 
+        else:
+            print(f"ℹ️ [SPEECH RECOGNITION] Transcribed text: \"{transcript}\" (No distress keywords matched)")
+
         return {
             "transcript": transcript,
             "recognized_keyword": recognized_keyword,
@@ -295,6 +434,7 @@ def process_audio_data(audio_data: sr.AudioData) -> dict:
         }
 
     except sr.UnknownValueError:
+        print("ℹ️ [SPEECH RECOGNITION] Incomprehensible audio or silence (UnknownValueError).")
         return {
             "transcript": "",
             "recognized_keyword": None,
@@ -303,7 +443,11 @@ def process_audio_data(audio_data: sr.AudioData) -> dict:
             "detail": "No clear speech recognized in audio segment"
         }
     except sr.RequestError as e:
+        print(f"❌ [SPEECH RECOGNITION ERROR] Google Speech API request error: {e}")
         return {"error": f"Speech recognition service error: {e}"}
+    except Exception as e:
+        print(f"❌ [SPEECH RECOGNITION EXCEPTION] Unexpected error during recognition: {e}\n{traceback.format_exc()}")
+        return {"error": f"Unexpected error during speech recognition: {e}"}
 
 
 # ==========================================
@@ -386,15 +530,27 @@ async def api_upload_audio(
             except Exception:
                 raw_bytes = body
 
-    if not raw_bytes:
+    if not raw_bytes or len(raw_bytes) == 0:
         raise HTTPException(status_code=400, detail="No audio payload provided.")
 
-    # Parse container (WAV) or raw PCM
-    try:
-        with sr.AudioFile(io.BytesIO(raw_bytes)) as source:
-            audio_data = recognizer.record(source)
-    except Exception:
-        # Fall back to raw 16-bit PCM (sample_rate, 2 bytes per sample)
+    filename_hint = getattr(file, "filename", "audio_stream") if file else "payload"
+    print(f"\n[🎤 AUDIO INGEST] Payload received: {len(raw_bytes)} bytes (Source: '{filename_hint}').")
+
+    # Transcode browser-generated audio formats (WebM/Ogg/Opus/etc.) to 16-bit PCM WAV
+    wav_bytes = transcode_to_pcm_wav(raw_bytes, sample_rate)
+
+    audio_data = None
+    if wav_bytes:
+        try:
+            with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
+                audio_data = recognizer.record(source)
+            print(f"✅ [AUDIO PARSE] Successfully loaded {len(wav_bytes)} bytes WAV into SpeechRecognizer.")
+        except Exception as wav_parse_err:
+            print(f"⚠️ [AUDIO PARSE WARNING] sr.AudioFile could not parse converted WAV ({wav_parse_err}). Falling back to raw AudioData.")
+
+    if not audio_data:
+        # Fall back to raw PCM
+        print("⚠️ [AUDIO INGEST] Proceeding with raw 16-bit PCM AudioData fallback.")
         audio_data = sr.AudioData(raw_bytes, sample_rate, 2)
 
     result = process_audio_data(audio_data)
