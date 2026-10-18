@@ -18,7 +18,7 @@ WORKDIR /app
 
 # Install runtime system libraries:
 # - libgl1 & libglib2.0-0: OpenCV computer vision runtime dependencies
-# - libegl1 & libegl1-mesa: EGL runtime dependencies (fixes libEGL.so.1)
+# - libegl1: EGL runtime dependencies (fixes libEGL.so.1)
 # - libgomp1: OpenMP runtime for accelerated matrix operations
 # - libportaudio2 & libasound2: SoundDevice audio capture runtime
 # - curl: Container health checks and network diagnostics
@@ -26,7 +26,6 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     libgl1 \
     libglib2.0-0 \
     libegl1 \
-    libegl1-mesa \
     libgomp1 \
     libportaudio2 \
     libasound2 \
