@@ -62,6 +62,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # PORT CONFIGURATIONS & INTERNAL SERVICE ENDPOINTS
 # ---------------------------------------------------------------------------
 GATEWAY_PORT = int(os.environ.get("PORT", 8000))
+os.environ["GATEWAY_PORT"] = str(GATEWAY_PORT)
 GATEWAY_HOST = os.environ.get("HOST", "0.0.0.0")
 INPUT_SOURCE = os.environ.get("INPUT_SOURCE", "api").lower()
 
@@ -90,6 +91,7 @@ def start_internal_services():
     env = os.environ.copy()
     env["INPUT_SOURCE"] = INPUT_SOURCE
     env["CAMERA_SERVER_URL"] = CAMERA_SERVICE_URL
+    env["GATEWAY_PORT"] = str(GATEWAY_PORT)
 
     service_configs = [
         ("camera_server.py", [sys.executable, os.path.join(BASE_DIR, "camera_server.py"), "--port", str(CAMERA_PORT), "--input-source", INPUT_SOURCE]),
@@ -491,6 +493,7 @@ def main():
     GATEWAY_HOST = args.host
     INPUT_SOURCE = args.input_source
     os.environ["PORT"] = str(GATEWAY_PORT)
+    os.environ["GATEWAY_PORT"] = str(GATEWAY_PORT)
     os.environ["INPUT_SOURCE"] = INPUT_SOURCE
 
     print("\n======================================================================")

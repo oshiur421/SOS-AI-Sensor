@@ -34,6 +34,7 @@ parser.add_argument(
 parser.add_argument("--port", type=int, default=8002, help="Port to run fall detection server on in API mode (default: 8002)")
 parser.add_argument("--host", type=str, default=os.environ.get("HOST", "0.0.0.0"), help="Host address to bind to (default: 0.0.0.0)")
 parser.add_argument("--camera-url", type=str, default=os.environ.get("CAMERA_URL", "http://127.0.0.1:8001/frame"), help="Camera frame URL")
+parser.add_argument("--gateway-port", type=int, default=int(os.environ.get("GATEWAY_PORT", 8000)), help="Gateway public port for backend alerts (default: 8000)")
 
 cli_args, _ = parser.parse_known_args()
 
@@ -41,6 +42,8 @@ INPUT_SOURCE = "api" if cli_args.input_source.lower() in ["api", "cloud", "clien
 SERVER_HOST = cli_args.host
 SERVER_PORT = cli_args.port
 CAMERA_URL = cli_args.camera_url
+GATEWAY_PORT = cli_args.gateway_port
+BACKEND_ALERT_URL = os.environ.get("BACKEND_ALERT_URL", f"http://127.0.0.1:{GATEWAY_PORT}/api/v1/alerts")
 http_session = requests.Session()
 
 # ==========================================
@@ -154,7 +157,7 @@ FALL_COOLDOWN_SECONDS = 10
 
 
 def send_fall_alert(threat_level="CRITICAL", snapshot_b64=None):
-    url = "http://127.0.0.1:8000/api/v1/alerts"
+    url = BACKEND_ALERT_URL
     raw_data = {
         "incident": "fall_detected",
         "threat_level": threat_level,
@@ -469,6 +472,8 @@ def get_fall_status():
             "service": "AEGIS Fall Detection Sensor",
             "input_source": INPUT_SOURCE,
             "port": SERVER_PORT,
+            "gateway_port": GATEWAY_PORT,
+            "backend_url": BACKEND_ALERT_URL,
             "is_fallen": is_fallen,
             "threat_level": current_threat_level if is_fallen else "NORMAL",
             "elapsed_fall_sec": elapsed
@@ -547,6 +552,7 @@ if __name__ == "__main__":
     source_label = "CLIENT-SIDE APIS (Cloud Mode)" if INPUT_SOURCE == "api" else "LOCAL HARDWARE STREAM"
     print(f"Input Source: {INPUT_SOURCE.upper()} - {source_label}")
     print(f"Camera Frame Source: {CAMERA_URL}")
+    print(f"Backend Target URL:  {BACKEND_ALERT_URL}")
     print("Pose Aspect Ratio & Landmark detection active.")
     print("Duration-based observation timer active (HIGH: 15s, CRITICAL: 20s).")
     print("=" * 65 + "\n")

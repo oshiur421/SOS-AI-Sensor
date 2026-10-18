@@ -49,17 +49,19 @@ parser.add_argument(
 )
 parser.add_argument("--port", type=int, default=8003, help="Port to run voice detection API server on (default: 8003)")
 parser.add_argument("--host", type=str, default=os.environ.get("HOST", "0.0.0.0"), help="Host address to bind to (default: 0.0.0.0)")
+parser.add_argument("--gateway-port", type=int, default=int(os.environ.get("GATEWAY_PORT", 8000)), help="Gateway public port for backend alerts (default: 8000)")
 
 cli_args, _ = parser.parse_known_args()
 
 INPUT_SOURCE = "api" if cli_args.input_source.lower() in ["api", "cloud", "client"] else "hardware"
 SERVER_HOST = cli_args.host
 SERVER_PORT = cli_args.port
+GATEWAY_PORT = cli_args.gateway_port
 
 # ==========================================
 # CONFIGURATION & ALERT COOLDOWN
 # ==========================================
-BACKEND_ALERT_URL = "http://127.0.0.1:8000/api/v1/alerts"
+BACKEND_ALERT_URL = os.environ.get("BACKEND_ALERT_URL", f"http://127.0.0.1:{GATEWAY_PORT}/api/v1/alerts")
 CAMERA_SERVER_URL = os.environ.get("CAMERA_SERVER_URL", "http://127.0.0.1:8001")
 COOLDOWN_SECONDS = 10
 last_alert_time = 0
@@ -482,6 +484,7 @@ def get_voice_status():
         "service": "AEGIS AI Emergency Voice Detector",
         "input_source": INPUT_SOURCE,
         "port": SERVER_PORT,
+        "gateway_port": GATEWAY_PORT,
         "backend_url": BACKEND_ALERT_URL,
         "camera_server_url": CAMERA_SERVER_URL
     }

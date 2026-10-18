@@ -31,13 +31,15 @@ CLASSIFIER_PATH = os.path.join(BASE_DIR, "gesture_landmark_model.pkl")
 # ALERT CONFIGURATION & HELPERS
 # ==========================================
 
+GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", 8000))
+BACKEND_ALERT_URL = os.environ.get("BACKEND_ALERT_URL", f"http://127.0.0.1:{GATEWAY_PORT}/api/v1/alerts")
 last_alert_time = 0
 COOLDOWN_SECONDS = 10
 sos_timestamps = []
 
 
 def send_gesture_alert(gesture_name, confidence=None, dynamic_threat_level="CRITICAL", snapshot_b64=None, frame=None):
-    url = "http://127.0.0.1:8000/api/v1/alerts"
+    url = BACKEND_ALERT_URL
     conf_val = float(confidence) if confidence is not None else 1.0
 
     # If snapshot_b64 not pre-encoded but frame is passed, encode now
@@ -194,6 +196,7 @@ parser.add_argument(
 parser.add_argument("--port", type=int, default=5000, help="Port to run gesture server on (default: 5000)")
 parser.add_argument("--host", type=str, default=os.environ.get("HOST", "0.0.0.0"), help="Host address to bind to (default: 0.0.0.0)")
 parser.add_argument("--camera-url", type=str, default=os.environ.get("CAMERA_URL", "http://127.0.0.1:8001/frame"), help="Camera frame URL")
+parser.add_argument("--gateway-port", type=int, default=int(os.environ.get("GATEWAY_PORT", 8000)), help="Gateway public port for backend alerts (default: 8000)")
 
 cli_args, _ = parser.parse_known_args()
 
@@ -201,6 +204,8 @@ INPUT_SOURCE = "api" if cli_args.input_source.lower() in ["api", "cloud", "clien
 SERVER_HOST = cli_args.host
 SERVER_PORT = cli_args.port
 CAMERA_URL = cli_args.camera_url
+GATEWAY_PORT = cli_args.gateway_port
+BACKEND_ALERT_URL = os.environ.get("BACKEND_ALERT_URL", f"http://127.0.0.1:{GATEWAY_PORT}/api/v1/alerts")
 
 
 # ==========================================
@@ -461,6 +466,8 @@ def api_status():
         "service": "AEGIS Hand Gesture Landmark Sensor",
         "input_source": INPUT_SOURCE,
         "port": SERVER_PORT,
+        "gateway_port": GATEWAY_PORT,
+        "backend_url": BACKEND_ALERT_URL,
         "camera_url": CAMERA_URL,
         "sos_window_count": len(sos_timestamps)
     })
@@ -598,6 +605,7 @@ if __name__ == "__main__":
     source_label = "CLIENT-SIDE APIS (Cloud Mode)" if INPUT_SOURCE == "api" else "LOCAL HARDWARE STREAM"
     print(f"Input Source:       {INPUT_SOURCE.upper()} - {source_label}")
     print(f"Server Endpoint:    http://{SERVER_HOST}:{SERVER_PORT}")
+    print(f"Backend Target URL: {BACKEND_ALERT_URL}")
     print(f"Direct Stream Feed: http://localhost:{SERVER_PORT}/video_feed")
     print(f"Client API Upload:  POST http://localhost:{SERVER_PORT}/api/gesture/frame")
     print(f"Telemetry API:      GET  http://localhost:{SERVER_PORT}/status")
