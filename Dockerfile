@@ -40,16 +40,11 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy all project files into the container
 COPY . .
 
-# Expose microservice ports:
-# - 8001: Central Camera Streaming & PTZ Server (FastAPI)
-# - 8002: Pose Fall Detection Server (FastAPI)
-# - 5000: Hand Gesture Landmark & Detection Server (Flask)
-# - 8003: Emergency Voice & Acoustic Monitor (FastAPI)
-EXPOSE 8001 8002 5000 8003
+# Expose single public entry port for container platforms (Render, Cloud Run, etc.)
+# 8000: AEGIS Unified Sensor API Gateway (routes to internal camera :8001, voice :8003, fall :8002, gesture :5000)
+EXPOSE 8000
 
-# Set entry point to execute the master coordination script.
-# This script spawns and supervises all sensor microservices (camera_server.py,
-# fall_detection.py, test_landmark_gesture.py, and voice_emergency.py)
-# concurrently using subprocesses, honoring the configured --input-source.
-ENTRYPOINT ["python", "start_aegis.py"]
+# Set entry point to execute the master API Gateway orchestrator.
+# Spawns internal microservices and routes all external requests through the unified port.
+ENTRYPOINT ["python", "master.py"]
 CMD []

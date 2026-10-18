@@ -54,6 +54,12 @@ for dashboard_candidate in ("server.py", "app.py"):
 
 
 def main():
+    try:
+        from master import main as gateway_main
+        gateway_main()
+        return
+    except Exception as e:
+        print(f"[!] Falling back to legacy runner: {e}")
     parser = argparse.ArgumentParser(description="AEGIS Emergency SOS System - Master Launcher")
     parser.add_argument(
         "--input-source",

@@ -12,3 +12,4 @@ sounddevice>=0.4.6
 SpeechRecognition>=3.10.0
 python-multipart>=0.0.9
 ultralytics>=8.1.0
+httpx>=0.27.0
