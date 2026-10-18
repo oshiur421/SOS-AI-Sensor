@@ -35,9 +35,11 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+import asyncio
+import httpx
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, Response, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Response, Request, UploadFile, File, BackgroundTasks
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -69,6 +71,8 @@ parser.add_argument(
     choices=["hardware", "api", "cloud"],
     help="Toggle input source: 'hardware' (local webcam) or 'api'/'cloud' (client-side API ingestion)"
 )
+parser.add_argument("--fall-server-url", type=str, default=os.environ.get("FALL_SERVER_URL", "http://127.0.0.1:8002"), help="Downstream fall detection server URL")
+parser.add_argument("--gesture-server-url", type=str, default=os.environ.get("GESTURE_SERVER_URL", "http://127.0.0.1:5000"), help="Downstream gesture recognition server URL")
 
 cli_args, _ = parser.parse_known_args()
 
@@ -76,6 +80,8 @@ INPUT_SOURCE = "api" if cli_args.input_source.lower() in ["api", "cloud", "clien
 SERVER_HOST = cli_args.host
 SERVER_PORT = cli_args.port
 CAMERA_SOURCE = parse_camera_source(cli_args.source)
+FALL_SERVER_URL = cli_args.fall_server_url
+GESTURE_SERVER_URL = cli_args.gesture_server_url
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 JPEG_QUALITY = 75
@@ -312,6 +318,61 @@ def capture_loop():
 
 
 # =============================================================================
+# ASYNCHRONOUS FRAME DISTRIBUTOR (FALL & GESTURE SENSORS)
+# =============================================================================
+
+forwarder_client: Optional[httpx.AsyncClient] = None
+
+def get_forwarder_client() -> httpx.AsyncClient:
+    global forwarder_client
+    if forwarder_client is None or forwarder_client.is_closed:
+        forwarder_client = httpx.AsyncClient(timeout=httpx.Timeout(2.5, connect=1.0))
+    return forwarder_client
+
+
+def resolve_service_endpoint(base_or_full_url: str, default_endpoint: str) -> str:
+    url = base_or_full_url.strip().rstrip("/")
+    if any(url.endswith(ep) for ep in ["/frame", "/upload_frame", "/detect", "/detect_gesture"]):
+        return url
+    return f"{url}{default_endpoint}"
+
+
+async def _send_frame_to_sensor(client: httpx.AsyncClient, service_name: str, url: str, frame_bytes: bytes):
+    try:
+        # Multipart form data with key 'file' - natively ingested by both fall_detection and gesture servers
+        files = {"file": ("frame.jpg", frame_bytes, "image/jpeg")}
+        await client.post(url, files=files)
+    except (httpx.TimeoutException, httpx.RequestError):
+        # Gracefully handle connection errors / offline downstream services without crashing
+        pass
+    except Exception as exc:
+        print(f"⚠️ [FRAME DISTRIBUTOR ERROR] Failed to forward frame to {service_name} ({url}): {exc}")
+
+
+async def forward_frame_to_sensors(frame_bytes: bytes):
+    """
+    Asynchronously forwards the ingested frame payload to FALL_SERVER_URL and GESTURE_SERVER_URL
+    using httpx.AsyncClient in a background task without blocking the camera feed.
+    """
+    if not frame_bytes:
+        return
+
+    client = get_forwarder_client()
+    tasks = []
+
+    if FALL_SERVER_URL:
+        fall_url = resolve_service_endpoint(FALL_SERVER_URL, "/api/fall/frame")
+        tasks.append(_send_frame_to_sensor(client, "Fall Sensor", fall_url, frame_bytes))
+
+    if GESTURE_SERVER_URL:
+        gesture_url = resolve_service_endpoint(GESTURE_SERVER_URL, "/api/gesture/frame")
+        tasks.append(_send_frame_to_sensor(client, "Gesture Sensor", gesture_url, frame_bytes))
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# =============================================================================
 # FASTAPI APPLICATION SETUP
 # =============================================================================
 
@@ -322,8 +383,13 @@ async def lifespan(app: FastAPI):
     t.start()
     yield
     # Shutdown
-    global is_running
+    global is_running, forwarder_client
     is_running = False
+    if forwarder_client and not forwarder_client.is_closed:
+        try:
+            await forwarder_client.aclose()
+        except Exception:
+            pass
     if cap is not None and cap.isOpened():
         try:
             cap.release()
@@ -459,7 +525,9 @@ def get_status():
             "filter": CAMERA_FILTER,
             "zoom": ZOOM_LEVEL,
             "pan": PAN_X,
-            "tilt": TILT_Y
+            "tilt": TILT_Y,
+            "fall_server_url": FALL_SERVER_URL,
+            "gesture_server_url": GESTURE_SERVER_URL
         }
 
 
@@ -477,6 +545,7 @@ class FrameUploadPayload(BaseModel):
 @app.post("/api/camera/frame", summary="Upload Frame from Client-Side API")
 @app.post("/upload_frame", summary="Upload Frame from Client-Side API")
 async def upload_frame(
+    background_tasks: BackgroundTasks,
     file: Optional[UploadFile] = File(None),
     payload: Optional[FrameUploadPayload] = None,
     request: Request = None
@@ -527,6 +596,9 @@ async def upload_frame(
     success = ingest_client_frame(raw_frame)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to process and encode frame.")
+
+    # Frame Distributor: asynchronously forward the frame payload to FALL_SERVER_URL and GESTURE_SERVER_URL
+    background_tasks.add_task(forward_frame_to_sensors, raw_bytes)
 
     return {
         "status": "success",
@@ -883,6 +955,8 @@ if __name__ == "__main__":
     print(f"Direct Browser URL: http://localhost:{SERVER_PORT}")
     print(f"Stream URL:        http://localhost:{SERVER_PORT}/video_feed")
     print(f"Sensor Frame API:  http://localhost:{SERVER_PORT}/frame")
+    print(f"Distribute Fall:   {FALL_SERVER_URL}")
+    print(f"Distribute Gesture:{GESTURE_SERVER_URL}")
     print(f"Telemetry API:     http://localhost:{SERVER_PORT}/status")
     print("Press Ctrl+C to stop.")
     print("=" * 65 + "\n")

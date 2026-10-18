@@ -76,6 +76,9 @@ FALL_SERVICE_URL = f"http://127.0.0.1:{FALL_PORT}"
 VOICE_SERVICE_URL = f"http://127.0.0.1:{VOICE_PORT}"
 GESTURE_SERVICE_URL = f"http://127.0.0.1:{GESTURE_PORT}"
 
+os.environ["FALL_SERVER_URL"] = FALL_SERVICE_URL
+os.environ["GESTURE_SERVER_URL"] = GESTURE_SERVICE_URL
+
 # Global subprocesses & shared HTTP client
 background_processes: List[subprocess.Popen] = []
 http_client: Optional[httpx.AsyncClient] = None
@@ -92,6 +95,8 @@ def start_internal_services():
     env["INPUT_SOURCE"] = INPUT_SOURCE
     env["CAMERA_SERVER_URL"] = CAMERA_SERVICE_URL
     env["GATEWAY_PORT"] = str(GATEWAY_PORT)
+    env["FALL_SERVER_URL"] = FALL_SERVICE_URL
+    env["GESTURE_SERVER_URL"] = GESTURE_SERVICE_URL
 
     service_configs = [
         ("camera_server.py", [sys.executable, os.path.join(BASE_DIR, "camera_server.py"), "--port", str(CAMERA_PORT), "--input-source", INPUT_SOURCE]),
