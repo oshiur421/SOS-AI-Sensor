@@ -369,7 +369,76 @@ async def route_gesture(path: str, request: Request):
     return await proxy_request(f"{GESTURE_SERVICE_URL}/api/gesture/{path}", request)
 
 
-# 5. Gateway Health & Discovery
+# 5. Alerts API (Ingestion & Polling for SOS Dashboard)
+alerts_db: List[Dict[str, Any]] = []
+alert_id_counter = 1
+
+
+@app.get("/api/v1/alerts", summary="Get All Emergency Alerts")
+async def get_alerts():
+    return alerts_db
+
+
+@app.post("/api/v1/alerts", status_code=201, summary="Ingest Emergency Alert")
+async def create_alert(request: Request):
+    global alert_id_counter
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    alert = {
+        "id": alert_id_counter,
+        "title": payload.get("title", "Emergency Incident Alert"),
+        "threat_level": (payload.get("threat_level") or "HIGH").upper(),
+        "detection_source": payload.get("detection_source", "AI_SENSOR"),
+        "latitude": payload.get("latitude", 23.8769),
+        "longitude": payload.get("longitude", 90.3204),
+        "location_name": payload.get("location_name", "Daffodil Smart City - Ashulia, Dhaka"),
+        "description": payload.get("description", "Emergency telemetry alert registered."),
+        "raw_detection_data": payload.get("raw_detection_data") or {},
+        "snapshot_b64": payload.get("snapshot_b64"),
+        "status": (payload.get("status") or "ACTIVE").upper(),
+        "sms_status": "SENT" if (payload.get("threat_level") or "").upper() in ("CRITICAL", "HIGH") else "SKIPPED",
+        "timestamp": now_iso,
+        "created_at": now_iso
+    }
+    alert_id_counter += 1
+    alerts_db.insert(0, alert)
+    return alert
+
+
+@app.patch("/api/v1/alerts/{alert_id}", summary="Update Alert Status")
+async def update_alert(alert_id: int, request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    for alert in alerts_db:
+        if alert.get("id") == alert_id:
+            if "status" in payload:
+                alert["status"] = payload["status"].upper()
+            if "threat_level" in payload:
+                alert["threat_level"] = payload["threat_level"].upper()
+            if "notes" in payload:
+                alert["notes"] = payload["notes"]
+            return alert
+    return JSONResponse(status_code=404, content={"detail": f"Alert #{alert_id} not found"})
+
+
+@app.delete("/api/v1/alerts", summary="Purge All Alerts")
+async def purge_alerts():
+    alerts_db.clear()
+    return {"status": "success", "message": "All alerts purged"}
+
+
+@app.get("/api/v1/health", summary="Health Check")
+async def v1_health_check():
+    return {"status": "healthy", "service": "AEGIS Unified Sensor API Gateway", "online": True}
+
+
+# 6. Gateway Health & Discovery
 @app.get("/", summary="Gateway Status & Topology")
 @app.get("/health", summary="Gateway Health Check")
 async def gateway_health():
