@@ -194,13 +194,49 @@ app = FastAPI(
 )
 
 # Enable CORS for all external origins (GitHub Pages, local dev, remote frontends)
+# Configured strictly to ensure all responses (including 503 errors) reach frontend without CORS blocks
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
+
+
+# ---------------------------------------------------------------------------
+# GLOBAL EXCEPTION HANDLERS (503 SERVICE UNAVAILABLE WITH CORS)
+# ---------------------------------------------------------------------------
+@app.exception_handler(httpx.TimeoutException)
+async def gateway_timeout_handler(request: Request, exc: httpx.TimeoutException):
+    return JSONResponse(
+        status_code=503,
+        content={
+            "status": "error",
+            "error": "Service Unavailable",
+            "message": "Internal microservice request timed out.",
+            "detail": str(exc),
+            "url": str(request.url)
+        },
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
+
+
+@app.exception_handler(httpx.RequestError)
+async def gateway_request_error_handler(request: Request, exc: httpx.RequestError):
+    return JSONResponse(
+        status_code=503,
+        content={
+            "status": "error",
+            "error": "Service Unavailable",
+            "message": "Internal microservice is unreachable, starting up, or crashed.",
+            "detail": str(exc),
+            "url": str(request.url)
+        },
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -240,29 +276,74 @@ async def proxy_request(target_url: str, request: Request) -> Response:
             headers=resp_headers,
             media_type=upstream_resp.headers.get("content-type")
         )
-    except httpx.ConnectError:
+    except httpx.TimeoutException as exc:
+        print(f"⏱️ [GATEWAY 503 TIMEOUT] Target {target_url} timed out: {exc}")
         return JSONResponse(
             status_code=503,
-            content={"error": "Service Unavailable", "detail": f"Internal microservice at {target_url} is starting up or unreachable."}
+            content={
+                "status": "error",
+                "error": "Service Unavailable",
+                "message": f"Internal sensor service at {target_url} timed out.",
+                "target": target_url,
+                "detail": str(exc)
+            },
+            headers={"Access-Control-Allow-Origin": "*"}
         )
     except httpx.RequestError as exc:
+        print(f"⚠️ [GATEWAY 503 UNAVAILABLE] Target {target_url} unreachable: {exc}")
         return JSONResponse(
-            status_code=502,
-            content={"error": "Bad Gateway", "detail": str(exc), "target": target_url}
+            status_code=503,
+            content={
+                "status": "error",
+                "error": "Service Unavailable",
+                "message": f"Internal sensor service at {target_url} is unreachable, starting up, or crashed.",
+                "target": target_url,
+                "detail": str(exc)
+            },
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+    except Exception as exc:
+        print(f"❌ [GATEWAY 503 ERROR] Unexpected error forwarding to {target_url}: {exc}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error": "Service Unavailable",
+                "message": f"Gateway encountered an error communicating with internal service at {target_url}.",
+                "target": target_url,
+                "detail": str(exc)
+            },
+            headers={"Access-Control-Allow-Origin": "*"}
         )
 
 
 async def stream_mjpeg(target_url: str):
     """Streams continuous multipart MJPEG video from camera microservice."""
-    client = httpx.AsyncClient(timeout=None)
+    client = httpx.AsyncClient(timeout=httpx.Timeout(timeout=None, connect=5.0))
     try:
         req = client.build_request("GET", target_url)
         res = await client.send(req, stream=True)
+
+        if res.status_code != 200:
+            await res.aclose()
+            await client.aclose()
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "error": "Service Unavailable",
+                    "message": f"Camera microservice returned HTTP {res.status_code}",
+                    "target": target_url
+                },
+                headers={"Access-Control-Allow-Origin": "*"}
+            )
 
         async def body_stream():
             try:
                 async for chunk in res.aiter_raw():
                     yield chunk
+            except Exception as stream_err:
+                print(f"⚠️ [STREAM INTERRUPTED] {stream_err}")
             finally:
                 await res.aclose()
                 await client.aclose()
@@ -274,14 +355,48 @@ async def stream_mjpeg(target_url: str):
             headers={
                 "Cache-Control": "no-cache, no-store, must-revalidate",
                 "Pragma": "no-cache",
-                "Connection": "close"
+                "Connection": "close",
+                "Access-Control-Allow-Origin": "*"
             }
+        )
+    except httpx.TimeoutException as exc:
+        await client.aclose()
+        print(f"⏱️ [STREAM 503 TIMEOUT] Camera stream at {target_url} timed out: {exc}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error": "Service Unavailable",
+                "message": f"Camera video stream at {target_url} timed out.",
+                "detail": str(exc)
+            },
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+    except httpx.RequestError as exc:
+        await client.aclose()
+        print(f"⚠️ [STREAM 503 UNAVAILABLE] Camera stream at {target_url} unreachable: {exc}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error": "Service Unavailable",
+                "message": f"Camera video stream at {target_url} is unreachable or offline.",
+                "detail": str(exc)
+            },
+            headers={"Access-Control-Allow-Origin": "*"}
         )
     except Exception as exc:
         await client.aclose()
+        print(f"❌ [STREAM 503 ERROR] Unexpected error in camera stream: {exc}")
         return JSONResponse(
             status_code=503,
-            content={"error": "Camera stream unavailable", "detail": str(exc)}
+            content={
+                "status": "error",
+                "error": "Service Unavailable",
+                "message": "Camera video stream is currently unavailable.",
+                "detail": str(exc)
+            },
+            headers={"Access-Control-Allow-Origin": "*"}
         )
 
 
